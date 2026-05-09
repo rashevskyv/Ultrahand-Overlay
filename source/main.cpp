@@ -394,6 +394,13 @@ bool processHold(uint64_t keysDown, uint64_t keysHeld, u64& holdStartTick, bool&
 
                 lastSelectedListItem->setValue(lastSelectedListItemFooter, highlightParam);
                 lastSelectedListItemFooter.clear();
+
+                if (lastCommandMode == TOGGLE_STR) {
+                    // lastToggleTargetState holds the post-onClick (i.e. new) state;
+                    // on cancel we revert to the original, which is its negation.
+                    static_cast<tsl::elm::ToggleListItem*>(lastSelectedListItem)
+                        ->setState(!lastToggleTargetState);
+                }
             } else {
                 lastSelectedListItem->setValue("", true);
             }
@@ -3882,10 +3889,9 @@ public:
                         toggleListItem->setValue(INPROGRESS_SYMBOL);
 
                     if (isHold && !lastCommandIsHold) {
-                        runningInterpreter.store(true, std::memory_order_release);
                         toggleListItem->setState(!state);
-                        runningInterpreter.store(false, std::memory_order_release);
-                        
+
+                        lastSelectedListItemFooter = toggleListItem->getValue();
                         lastSelectedListItem = toggleListItem;
                         holdStartTick = armGetSystemTick();
                         storedCommands = std::move(modifiedCmds);
@@ -5010,60 +5016,61 @@ bool drawCommandsMenu(
             }
 
             
-            // Skip config.ini for toggles with toggle_state — external source is the single source of truth
-            if (toggleStateMode.empty()) {
-            if (isFile(packageConfigIniPath)) {
-                packageConfigData = getParsedDataFromIniFile(packageConfigIniPath);
-                
-                bool shouldSaveINI = false;
-                
-                // Only sync footer if pattern was provided
-                shouldSaveINI |= syncIniValue(packageConfigData, packageConfigIniPath, optionName, FOOTER_STR, commandFooter);
-                
-                // Always try to load footer_highlight from config.ini if it exists
-                auto optionIt = packageConfigData.find(optionName);
-                if (optionIt != packageConfigData.end()) {
-                    auto footerHighlightIt = optionIt->second.find(FOOTER_HIGHLIGHT_STR);
-                    if (footerHighlightIt != optionIt->second.end() && !footerHighlightIt->second.empty()) {
-                        // Load the non-empty value from config.ini
-                        commandFooterHighlight = (footerHighlightIt->second == TRUE_STR);
-                        commandFooterHighlightDefined = true;
+            // Skip config.ini for toggles with toggle_state — external source is the single source of truth.
+            // Non-toggle modes (option/slot/dropdown) always use config.ini regardless of toggle_state.
+            if (commandMode != TOGGLE_STR || toggleStateMode.empty()) {
+                if (isFile(packageConfigIniPath)) {
+                    packageConfigData = getParsedDataFromIniFile(packageConfigIniPath);
+                    
+                    bool shouldSaveINI = false;
+                    
+                    // Only sync footer if pattern was provided
+                    shouldSaveINI |= syncIniValue(packageConfigData, packageConfigIniPath, optionName, FOOTER_STR, commandFooter);
+                    
+                    // Always try to load footer_highlight from config.ini if it exists
+                    auto optionIt = packageConfigData.find(optionName);
+                    if (optionIt != packageConfigData.end()) {
+                        auto footerHighlightIt = optionIt->second.find(FOOTER_HIGHLIGHT_STR);
+                        if (footerHighlightIt != optionIt->second.end() && !footerHighlightIt->second.empty()) {
+                            // Load the non-empty value from config.ini
+                            commandFooterHighlight = (footerHighlightIt->second == TRUE_STR);
+                            commandFooterHighlightDefined = true;
+                        }
                     }
-                }
-                
-                // Only write footer_highlight back if it was defined in package INI but missing/empty in config
-                if (commandFooterHighlightDefined && optionIt != packageConfigData.end()) {
-                    auto it = optionIt->second.find(FOOTER_HIGHLIGHT_STR);
-                    if (it == optionIt->second.end() || it->second.empty()) {
+                    
+                    // Only write footer_highlight back if it was defined in package INI but missing/empty in config
+                    if (commandFooterHighlightDefined && optionIt != packageConfigData.end()) {
+                        auto it = optionIt->second.find(FOOTER_HIGHLIGHT_STR);
+                        if (it == optionIt->second.end() || it->second.empty()) {
+                            packageConfigData[optionName][FOOTER_HIGHLIGHT_STR] = commandFooterHighlight ? TRUE_STR : FALSE_STR;
+                            shouldSaveINI = true;
+                        }
+                    }
+                    
+                    // Save all changes in one batch write
+                    if (shouldSaveINI)
+                        saveIniFileData(packageConfigIniPath, packageConfigData);
+                    packageConfigData.clear();
+                } else { // write default data if settings are not loaded
+                    // Load any existing data first (might be empty if file doesn't exist)
+                    packageConfigData = getParsedDataFromIniFile(packageConfigIniPath);
+                    
+                    // Only add footer if pattern was provided
+                    if (!commandFooter.empty() && commandFooter != NULL_STR) {
+                        packageConfigData[optionName][FOOTER_STR] = commandFooter;
+                    }
+                    // Only add footer_highlight if it was defined in package INI
+                    if (commandFooterHighlightDefined) {
                         packageConfigData[optionName][FOOTER_HIGHLIGHT_STR] = commandFooterHighlight ? TRUE_STR : FALSE_STR;
-                        shouldSaveINI = true;
                     }
+                    
+                    // Save the config file once
+                    if ((!commandFooter.empty() && commandFooter != NULL_STR) || commandFooterHighlightDefined) {
+                        saveIniFileData(packageConfigIniPath, packageConfigData);
+                    }
+                    packageConfigData.clear();
                 }
-                
-                // Save all changes in one batch write
-                if (shouldSaveINI)
-                    saveIniFileData(packageConfigIniPath, packageConfigData);
-                packageConfigData.clear();
-            } else { // write default data if settings are not loaded
-                // Load any existing data first (might be empty if file doesn't exist)
-                packageConfigData = getParsedDataFromIniFile(packageConfigIniPath);
-                
-                // Only add footer if pattern was provided
-                if (!commandFooter.empty() && commandFooter != NULL_STR) {
-                    packageConfigData[optionName][FOOTER_STR] = commandFooter;
-                }
-                // Only add footer_highlight if it was defined in package INI
-                if (commandFooterHighlightDefined) {
-                    packageConfigData[optionName][FOOTER_HIGHLIGHT_STR] = commandFooterHighlight ? TRUE_STR : FALSE_STR;
-                }
-                
-                // Save the config file once
-                if ((!commandFooter.empty() && commandFooter != NULL_STR) || commandFooterHighlightDefined) {
-                    saveIniFileData(packageConfigIniPath, packageConfigData);
-                }
-                packageConfigData.clear();
             }
-            } // end toggleStateMode.empty()
 
             
             
@@ -5671,11 +5678,11 @@ bool drawCommandsMenu(
                             auto modifiedCmds = state ? getSourceReplacement(commandsOn, pathPatternOn, i, packagePath) :
                                 getSourceReplacement(commandsOff, pathPatternOff, i, packagePath);
 
-                             if (isHold && !lastCommandIsHold) {
+                            if (isHold && !lastCommandIsHold) {
                                 lastToggleTargetState = state;
                                 lastToggleHasState = hasToggleState;
                                 toggleListItem->setState(!state);
-                                
+
                                 lastSelectedListItemFooter = toggleListItem->getValue();
                                 lastSelectedListItem = toggleListItem;
                                 holdStartTick = armGetSystemTick();
@@ -7487,13 +7494,10 @@ void initializeSettingsAndDirectories() {
     if (needsUpdate)
         saveIniFileData(ULTRAHAND_CONFIG_INI_PATH, iniData);
 
-    const std::string& holdTimeStr = sec["hold_time"];
-    {
-        int parsed = std::atoi(holdTimeStr.c_str());
-        if (parsed < 500) parsed = 500;
-        if (parsed > 10000) parsed = 10000;
-        ult::holdDurationMs = static_cast<u32>(parsed);
-    }
+    int holdParsed = std::atoi(sec["hold_time"].c_str());
+    if (holdParsed < 500) holdParsed = 500;
+    if (holdParsed > 10000) holdParsed = 10000;
+    ult::holdDurationMs = static_cast<u32>(holdParsed);
 
     // Sync combo and set initial menu page (run once)
     updateMenuCombos = copyTeslaKeyComboToUltrahand();
