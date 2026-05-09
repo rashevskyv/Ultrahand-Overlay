@@ -3882,9 +3882,7 @@ public:
                         toggleListItem->setValue(INPROGRESS_SYMBOL);
 
                     if (isHold && !lastCommandIsHold) {
-                        runningInterpreter.store(true, std::memory_order_release);
                         toggleListItem->setState(!state);
-                        runningInterpreter.store(false, std::memory_order_release);
 
                         lastSelectedListItemFooter = toggleListItem->getValue();
                         lastSelectedListItem = toggleListItem;
@@ -5676,9 +5674,7 @@ bool drawCommandsMenu(
                             if (isHold && !lastCommandIsHold) {
                                 lastToggleTargetState = state;
                                 lastToggleHasState = hasToggleState;
-                                runningInterpreter.store(true, std::memory_order_release);
                                 toggleListItem->setState(!state);
-                                runningInterpreter.store(false, std::memory_order_release);
 
                                 lastSelectedListItemFooter = toggleListItem->getValue();
                                 lastSelectedListItem = toggleListItem;
