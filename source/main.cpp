@@ -98,6 +98,13 @@ constexpr std::string_view GROUPING_PATTERN = ";grouping=";
 constexpr std::string_view FOOTER_PATTERN = ";footer=";
 constexpr std::string_view FOOTER_HIGHLIGHT_PATTERN = ";footer_highlight=";
 constexpr std::string_view HOLD_PATTERN = ";hold=";
+constexpr std::string_view HOLD_SECONDS_PATTERN = ";hold_seconds=";
+constexpr std::string_view WARNING_PATTERN = ";warning=";
+constexpr std::string_view WARNING_ON_PATTERN = ";warning_on=";
+constexpr std::string_view WARNING_OFF_PATTERN = ";warning_off=";
+constexpr std::string_view WARNING_COLOR_PATTERN = ";warning_color=";
+constexpr std::string_view WARNING_ICON_PATTERN  = ";warning_icon=";
+constexpr std::string_view ACCEPT_PATTERN = ";accept=";
 
 constexpr std::string_view MINI_PATTERN = ";mini=";
 constexpr std::string_view SELECTION_MINI_PATTERN = ";selection_mini=";
@@ -141,6 +148,13 @@ constexpr size_t GROUPING_PATTERN_LEN = GROUPING_PATTERN.size();
 constexpr size_t FOOTER_PATTERN_LEN = FOOTER_PATTERN.size();
 constexpr size_t FOOTER_HIGHLIGHT_PATTERN_LEN = FOOTER_HIGHLIGHT_PATTERN.size();
 constexpr size_t HOLD_PATTERN_LEN = HOLD_PATTERN.size();
+constexpr size_t HOLD_SECONDS_PATTERN_LEN = HOLD_SECONDS_PATTERN.size();
+constexpr size_t WARNING_PATTERN_LEN = WARNING_PATTERN.size();
+constexpr size_t WARNING_ON_PATTERN_LEN = WARNING_ON_PATTERN.size();
+constexpr size_t WARNING_OFF_PATTERN_LEN = WARNING_OFF_PATTERN.size();
+constexpr size_t WARNING_COLOR_PATTERN_LEN = WARNING_COLOR_PATTERN.size();
+constexpr size_t WARNING_ICON_PATTERN_LEN  = WARNING_ICON_PATTERN.size();
+constexpr size_t ACCEPT_PATTERN_LEN = ACCEPT_PATTERN.size();
 constexpr size_t MINI_PATTERN_LEN = MINI_PATTERN.size();
 constexpr size_t SELECTION_MINI_PATTERN_LEN = SELECTION_MINI_PATTERN.size();
 constexpr size_t PROGRESS_PATTERN_LEN = PROGRESS_PATTERN.size();
@@ -361,7 +375,18 @@ bool handleRunningInterpreter(uint64_t& keysDown, uint64_t& keysHeld) {
 static u64 holdStartTick = 0;
 static std::string lastSelectedListItemFooter;
 static std::vector<std::vector<std::string>> storedCommands;
+// Optional callback fired AFTER handleCommandHold runs the stored commands.
+// Used by inline warning-confirm to apply toggle state changes that would
+// otherwise depend on lastCommandMode == TOGGLE_STR + lastSelectedListItem
+// being the toggle (which is no longer true once Accept becomes the hold target).
+static std::function<void()> warningOnConfirmCallback;
 static bool holdRumbleFired[3] = {false, false, false}; // guards for the ~33%, ~66%, ~100% rumble pulses
+
+// Optional per-hold override of ult::holdDurationMs.  Set by callers (e.g. the
+// inline warning-confirm Accept item) before the first frame of a hold; reset
+// to 0 on completion / cancellation so the next unrelated hold falls back to
+// the global default again.
+static u64 holdDurationMsOverride = 0;
 
 bool processHold(uint64_t keysDown, uint64_t keysHeld, u64& holdStartTick, bool& isHolding,
                 std::function<void()> onComplete,
@@ -406,6 +431,7 @@ bool processHold(uint64_t keysDown, uint64_t keysHeld, u64& holdStartTick, bool&
             lastCommandMode.clear();
             lastCommandIsHold = false;
             lastKeyName.clear();
+            warningOnConfirmCallback = nullptr;
         }
 
         if (onRelease) onRelease();
@@ -418,9 +444,12 @@ bool processHold(uint64_t keysDown, uint64_t keysHeld, u64& holdStartTick, bool&
     else if (keysDown & KEY_LEFT) lastSelectedListItem->shakeHighlight(tsl::FocusDirection::Left);
     else if (keysDown & KEY_RIGHT) lastSelectedListItem->shakeHighlight(tsl::FocusDirection::Right);
     
-    // Update hold progress
+    // Update hold progress.  If an override has been set (e.g. by an
+    // inline-warning Accept item with `;hold_seconds=` configured), use it
+    // instead of the global ult::holdDurationMs default.
+    const u64 holdMs = (holdDurationMsOverride > 0) ? holdDurationMsOverride : static_cast<u64>(ult::holdDurationMs);
     const u64 elapsedMs = armTicksToNs(armGetSystemTick() - holdStartTick) / 1000000;
-    const int percentage = std::min(100, static_cast<int>((elapsedMs * 100) / ult::holdDurationMs));
+    const int percentage = std::min(100, static_cast<int>((elapsedMs * 100) / holdMs));
     displayPercentage.store(percentage, std::memory_order_release);
     
     // Threshold-crossing rumble pulses — fired at ~33%, ~66%, ~100% of the hold.
@@ -451,6 +480,10 @@ bool processHold(uint64_t keysDown, uint64_t keysHeld, u64& holdStartTick, bool&
         }
         
         if (onComplete) onComplete();
+
+        // Clear the per-hold duration override so the next unrelated hold
+        // falls back to the global ult::holdDurationMs default.
+        holdDurationMsOverride = 0;
         return true;
     }
     
@@ -596,6 +629,22 @@ static void handleTriggerExit() {
     }
 }
 
+// Forward-decls for the inline warning-confirm helpers; the namespace itself
+// is defined further down (after the input-helper free functions).
+namespace WarningConfirm {
+    bool isActive();
+    bool isCollapsing();   // true while the fade-out animation is in progress
+    bool isSettling();     // true during the brief post-collapse settling window
+    void collapse(bool animate = true);  // full reset; B-cancel animates, single-active replace skips
+    void collapseUI();         // UI-only; safe to call after a successful Accept-hold
+    void requestDeferredCollapse();   // mark pending; consumed once interpreter completes
+    bool consumeDeferredCollapse();   // returns true once and starts collapse fade-out
+    bool tickCollapseAnim();          // per-frame poll: finalizes removal once fade-out elapsed
+    bool tickSettle();                // per-frame poll: re-enables source highlight after settle window
+    void requestFocusToAccept();      // mark pending focus transfer to Accept (one-shot)
+    bool consumePendingFocusToAccept();   // run the focus transfer once Accept is in m_items
+}
+
 // The interpreter hold-and-launch pattern shared by SelectionOverlay,
 // PackageMenu, and MainMenu. The callers differ only in the path string
 // passed to executeInterpreterCommands; all other logic is identical.
@@ -620,6 +669,18 @@ static bool handleCommandHold(uint64_t keysDown, uint64_t keysHeld, const std::s
 
         executeInterpreterCommands(std::move(storedCommands), cmdPath, lastKeyName);
         lastRunningInterpreter.store(true, std::memory_order_release);
+        if (warningOnConfirmCallback) {
+            auto cb = std::move(warningOnConfirmCallback);
+            warningOnConfirmCallback = nullptr;
+            cb();
+        }
+        // Defer the UI removal until AFTER the interpreter has finished and
+        // handleInterpreterCompletion has updated the Accept item with
+        // CHECKMARK / CROSSMARK / footer.  Removing the banner+Accept here would
+        // run synchronously while the click animation triggered by processHold is
+        // still in flight and lastSelectedListItem still points at us, producing
+        // a use-after-free (LR=0xbebebebebebebebe) on the next handleInput frame.
+        if (WarningConfirm::isActive()) WarningConfirm::requestDeferredCollapse();
     }, nullptr, true);
     return true;
 }
@@ -665,6 +726,618 @@ static void setSystemSettingsReturn(const std::string& jumpName) {
     returnJumpItemName = jumpName;
     returnJumpItemValue.clear();
 }
+// =============================================================================
+// Inline warning/confirmation expansion
+// =============================================================================
+// When a list item carries a `;warning=`, `;warning_on=` or `;warning_off=`
+// directive, pressing A on it does NOT immediately execute the action.  Instead
+// the routines below splice a multi-line warning banner directly under the item
+// plus a hold-A "Accept" list item.  Only when the Accept hold completes does
+// the original action run.  Pressing B (or activating any other warning-armed
+// item) collapses the expansion.
+namespace WarningConfirm {
+
+    // The banner element (CustomDrawer) and Accept item, both pending in the
+    // currently visible list.  Non-null between expand() and collapse().
+    inline tsl::elm::Element*   g_banner       = nullptr;
+    inline tsl::elm::ListItem*  g_acceptItem   = nullptr;
+    inline tsl::elm::List*      g_list         = nullptr;
+    inline tsl::elm::ListItem*  g_sourceItem   = nullptr;
+    inline bool                 g_pendingCollapse = false;  // set by onComplete; consumed after handleInterpreterCompletion finishes
+    inline bool                 g_pendingFocusToAccept = false;  // set by expand(); consumed once Accept is live in m_items
+    inline u64                  g_collapseStartTick = 0;     // armGetSystemTick() when collapse fade-out began (0 = not collapsing)
+    inline u64                  g_settleStartTick   = 0;     // armGetSystemTick() when post-collapse settling began (0 = not settling)
+    inline tsl::elm::ListItem*  g_settleTarget      = nullptr;  // source item whose focus highlight is suppressed during settle
+
+    // Animation timings.  Expand fade-in is read directly inside the banner
+    // CustomDrawer lambda; the collapse fade-out is what tickCollapseAnim()
+    // measures against to decide when to actually drop banner+Accept.
+    constexpr u64               EXPAND_ANIM_NS   = 150ULL * 1000000ULL;  // 150 ms
+    constexpr u64               COLLAPSE_ANIM_NS = 220ULL * 1000000ULL;  // 220 ms
+    // After banner+Accept have been removed the List still needs a couple of
+    // frames to clamp m_offset, recompute m_listHeight and run its scroll
+    // animation toward the source item.  During that window we keep the
+    // source's focus highlight invisible -- otherwise the blue ring snaps
+    // onto a row that may itself be sliding to a new position, which the
+    // user perceives as a chaotic flash.  Once the window elapses we toggle
+    // m_focused back on and libtesla animates the ring in via its built-in
+    // pulse + m_clickAnimationProgress reset.
+    constexpr u64               SETTLE_ANIM_NS   = 250ULL * 1000000ULL;  // 250 ms
+
+    // Indent shared by the banner accent strip and the Accept-side accent strip.
+    // Keep these in sync so the bar is one continuous vertical line across both.
+    constexpr s32               BANNER_INDENT_PX = 36;
+    constexpr s32               ACCENT_WIDTH_PX  = 4;
+
+    // Builtin icon shapes drawn next to the warning text.  All are rendered
+    // via drawRect / drawLine / drawCircle so they don't depend on font glyph
+    // tables (which lack U+26A0 etc on the bundled system font).
+    enum class IconKind { Triangle, Info, Error, None };
+
+    inline IconKind parseIconKind(const std::string& s) {
+        if (s.empty())                             return IconKind::Triangle;
+        if (s == "triangle" || s == "warning")     return IconKind::Triangle;
+        if (s == "info"     || s == "i")           return IconKind::Info;
+        if (s == "error"    || s == "x" || s == "danger") return IconKind::Error;
+        if (s == "none"     || s == "off")         return IconKind::None;
+        return IconKind::Triangle;
+    }
+
+    // Parse a "#RRGGBB" / "RRGGBB" hex string into a 4-bit-per-channel tsl::Color.
+    // Falls back to `fallback` on any parse error (wrong length, non-hex char).
+    inline tsl::Color parseHexColor(const std::string& hexIn, tsl::Color fallback) {
+        std::string s = hexIn;
+        if (!s.empty() && s.front() == '#') s.erase(0, 1);
+        if (s.size() != 6) return fallback;
+        auto h = [](char c) -> int {
+            if (c >= '0' && c <= '9') return c - '0';
+            if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+            if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+            return -1;
+        };
+        const int r8 = h(s[0]) * 16 + h(s[1]);
+        const int g8 = h(s[2]) * 16 + h(s[3]);
+        const int b8 = h(s[4]) * 16 + h(s[5]);
+        if (r8 < 0 || g8 < 0 || b8 < 0) return fallback;
+        return tsl::Color(static_cast<u8>(r8 >> 4),
+                          static_cast<u8>(g8 >> 4),
+                          static_cast<u8>(b8 >> 4),
+                          0xF);
+    }
+
+    // The currently-active warning's accent color, exposed at namespace scope
+    // so the WarningAcceptListItem subclass can read it from its draw() override.
+    // Updated in expand() and read each frame.
+    inline tsl::Color           g_accentColor = tsl::warningTextColor;
+
+    // ListItem subclass that overlays the same vertical accent strip used by
+    // the banner above it, so banner+Accept appear as one connected panel.
+    class WarningAcceptListItem : public tsl::elm::ListItem {
+    public:
+        using tsl::elm::ListItem::ListItem;
+
+        u64        m_expandStartTick = 0;
+        tsl::Color m_accentColor     = tsl::warningTextColor;
+
+        virtual void draw(tsl::gfx::Renderer* r) override {
+            tsl::elm::ListItem::draw(r);
+
+            // Erase the top separator (libtesla draws a 1 px line at topBound
+            // in ListItem::draw -- tesla.hpp:7350).  We want banner + Accept
+            // to look like one continuous panel, so overwrite the line with
+            // the overlay's default background color.  Done before the accent
+            // strip so the strip itself, drawn next, sits on top of the
+            // erased pixel.
+            r->drawRect(this->getX() + 4, this->getY(),
+                        this->getWidth() + 10, 1,
+                        a(tsl::defaultBackgroundColor));
+
+            // Compute the same alpha factor as the banner so both fade in / out
+            // together.
+            const u64 nowTick = armGetSystemTick();
+            const u64 elapsedInNs = armTicksToNs(nowTick - m_expandStartTick);
+            float alpha = (elapsedInNs >= EXPAND_ANIM_NS) ? 1.0f
+                                                          : (static_cast<float>(elapsedInNs) / static_cast<float>(EXPAND_ANIM_NS));
+            if (g_collapseStartTick != 0) {
+                const u64 elapsedOutNs = armTicksToNs(nowTick - g_collapseStartTick);
+                const float tout = (elapsedOutNs >= COLLAPSE_ANIM_NS) ? 1.0f
+                                                                      : (static_cast<float>(elapsedOutNs) / static_cast<float>(COLLAPSE_ANIM_NS));
+                alpha *= (1.0f - tout);
+            }
+            if (alpha < 0.0f) alpha = 0.0f;
+            const u8 alphaScale = static_cast<u8>(0xF * alpha);
+            const tsl::Color& c = m_accentColor;
+            const u8 aFinal = static_cast<u8>((static_cast<u32>(c.a) * alphaScale) / 0xF);
+            const tsl::Color tint(c.r, c.g, c.b, aFinal);
+
+            // Strip joins the banner's strip above with no gap at the top,
+            // and skips the bottom 6 px so the focus-border halo of the next
+            // item below (libtesla's top halo for a focused item extends 5
+            // px UP, plus 1 px offset) isn't covered when the user navigates
+            // to that item with the warning still open.
+            //
+            // ListItem::layout() shifts its own X by +3 relative to its
+            // parent List (libtesla internals at tesla.hpp:7390), while the
+            // banner CustomDrawer sits at the raw List X.  Subtract 3 here
+            // so the banner strip and Accept strip share the exact same
+            // screen X.
+            constexpr s32 LIST_ITEM_X_OFFSET = 3;
+            constexpr s32 HALO_EXTENT_PX     = 6;
+            const s32 ax = this->getX() + BANNER_INDENT_PX - LIST_ITEM_X_OFFSET;
+            const s32 ay = this->getY();
+            const s32 ah = static_cast<s32>(this->getHeight()) - HALO_EXTENT_PX;
+            r->drawRect(ax, ay, ACCENT_WIDTH_PX, ah, tint);
+        }
+    };
+
+    inline bool isActive() { return g_acceptItem != nullptr; }
+
+    // True while a collapse animation is mid-flight (banner+Accept still in
+    // the list but fading out).  PackageMenu / MainMenu handleInput overrides
+    // swallow all input during this window so the player can't trigger a
+    // second hold or scroll while items are vanishing.
+    inline bool isCollapsing() { return g_collapseStartTick != 0; }
+
+    // True during the brief post-collapse window where banner+Accept are
+    // already gone but the source's highlight is still suppressed to let the
+    // List finish settling its scroll/layout state.  PackageMenu / MainMenu
+    // handleInput overrides treat this exactly like isCollapsing() for the
+    // purposes of swallowing input.
+    inline bool isSettling()   { return g_settleStartTick   != 0; }
+
+    // True iff the currently-active warning was expanded for `item`.  Used by
+    // source-item click listeners to implement "press source again to collapse".
+    inline bool isActiveFor(tsl::elm::ListItem* item) {
+        return isActive() && g_sourceItem == item;
+    }
+
+    // Decode `\n` escape sequences in-place so package authors can write
+    //     ;warning=Line 1\nLine 2
+    // and get a real line break.
+    inline void unescapeWarningText(std::string& s) {
+        if (s.empty()) return;
+        std::string out;
+        out.reserve(s.size());
+        for (size_t i = 0; i < s.size(); ++i) {
+            if (s[i] == '\\' && i + 1 < s.size()) {
+                const char nxt = s[i + 1];
+                if (nxt == 'n') { out.push_back('\n'); ++i; continue; }
+                if (nxt == 't') { out.push_back('\t'); ++i; continue; }
+                if (nxt == '\\') { out.push_back('\\'); ++i; continue; }
+            }
+            out.push_back(s[i]);
+        }
+        s = std::move(out);
+    }
+
+    // Cancel any in-flight hold targeting our Accept item, then queue removal
+    // of banner + Accept.  Safe to call when nothing is active.
+    // UI-only collapse: just drops the banner+Accept items from the list.
+    // Used after a successful Accept-hold (the existing handleCommandHold +
+    // interpreter pipeline already manages lastSelectedListItem / runningInterpreter
+    // and we must NOT clobber them here).
+    inline void collapseUI() {
+        // Defensive: clear lastSelectedListItem if it still aliases the Accept item
+        // we are about to remove.  In the deferred path, handleInterpreterCompletion
+        // has already cleared it, but B-cancel and single-active-rule resets reach
+        // this via collapse() while the global may still be live.
+        if (lastSelectedListItem == g_acceptItem && g_acceptItem != nullptr) {
+            lastSelectedListItem = nullptr;
+        }
+
+        // Move focus back to the source item BEFORE removing banner+Accept so
+        // that neither m_focusedElement (Gui-level raw pointer) nor m_focusedIndex
+        // (List-level index) end up dangling on a freed Element.  removePendingItems
+        // only adjusts m_focusedIndex; it does NOT clear the Gui's m_focusedElement,
+        // so without this transfer the next handleInput frame would call
+        // p->onClick(...) on freed memory (LR=0xbebebebebebebebe poison crash).
+        {
+            auto* tslOverlay = tsl::Overlay::get();
+            auto* gui = (tslOverlay != nullptr) ? tslOverlay->getCurrentGui().get() : nullptr;
+            if (gui != nullptr) {
+                if (g_list != nullptr && g_sourceItem != nullptr) {
+                    const s32 srcIdx = g_list->getIndexInList(g_sourceItem);
+                    if (srcIdx >= 0) {
+                        g_list->setFocusedIndex(static_cast<u32>(srcIdx));
+                    }
+                    gui->requestFocus(g_sourceItem, tsl::FocusDirection::None, false);
+                } else {
+                    if (g_acceptItem != nullptr) gui->removeFocus(g_acceptItem);
+                    if (g_banner     != nullptr) gui->removeFocus(g_banner);
+                }
+            }
+        }
+
+        if (g_list != nullptr) {
+            if (g_banner)     g_list->removeItem(g_banner);
+            if (g_acceptItem) g_list->removeItem(g_acceptItem);
+        }
+
+        // Hand off to the post-collapse settling window: the List still has
+        // a couple of frames of work (clamp m_offset, recompute m_listHeight,
+        // run its scroll animation) before the source row is at its final
+        // screen position.  Suppress the source's focus highlight for the
+        // duration of that window so it doesn't snap on while the row is
+        // still sliding.  tickSettle() restores the highlight when the timer
+        // elapses.
+        if (g_sourceItem != nullptr) {
+            g_settleTarget    = g_sourceItem;
+            g_settleStartTick = armGetSystemTick();
+            g_settleTarget->setFocused(false);
+        }
+
+        g_banner          = nullptr;
+        g_acceptItem      = nullptr;
+        g_list            = nullptr;
+        g_sourceItem      = nullptr;
+        g_pendingCollapse = false;
+        g_collapseStartTick = 0;
+    }
+
+    // Per-frame poll: once the post-collapse settling window has elapsed,
+    // re-enable the source item's focus highlight.  Setting m_focused=true
+    // via setFocused() also resets m_clickAnimationProgress, which is what
+    // libtesla's drawHighlight uses to animate the ring fade-in -- so the
+    // highlight reappears smoothly rather than popping on.
+    inline bool tickSettle() {
+        if (g_settleStartTick == 0) return false;
+        const u64 elapsedNs = armTicksToNs(armGetSystemTick() - g_settleStartTick);
+        if (elapsedNs >= SETTLE_ANIM_NS) {
+            if (g_settleTarget != nullptr) {
+                // Only restore the highlight on the settle target if Gui's
+                // focused element is still the same item.  If the player has
+                // navigated away during the settle window (or a new warning
+                // has grabbed focus through expand()), some OTHER element
+                // already has m_focused=true and is drawing its own ring; we
+                // must NOT also flip the settle target's flag on, otherwise
+                // two highlights paint on screen simultaneously.
+                auto* tslOverlay = tsl::Overlay::get();
+                auto* gui = (tslOverlay != nullptr) ? tslOverlay->getCurrentGui().get() : nullptr;
+                if (gui != nullptr && gui->getFocusedElement() == g_settleTarget) {
+                    g_settleTarget->setFocused(true);
+                }
+            }
+            g_settleTarget    = nullptr;
+            g_settleStartTick = 0;
+            return true;
+        }
+        return false;
+    }
+
+    // Forward decls needed below.
+    inline void beginCollapseAnim();
+
+    // Full collapse: cancels any in-flight hold targeting our Accept item,
+    // then either animates the UI fade-out (default) or drops it immediately
+    // (used by single-active-rule replacement so the new banner doesn't visually
+    // overlap with a fading old one).
+    inline void collapse(bool animate) {
+        if (lastSelectedListItem == g_acceptItem && g_acceptItem != nullptr) {
+            lastCommandIsHold = false;
+            displayPercentage.store(0, std::memory_order_release);
+            storedCommands.clear();
+            lastCommandMode.clear();
+            lastKeyName.clear();
+            lastSelectedListItem = nullptr;
+        }
+        warningOnConfirmCallback = nullptr;
+        if (animate) {
+            beginCollapseAnim();
+        } else {
+            collapseUI();
+        }
+    }
+
+    // Mark that the banner+Accept should be removed once the interpreter
+    // completion pipeline has finished updating the Accept ListItem.
+    inline void requestDeferredCollapse() {
+        if (g_acceptItem != nullptr) g_pendingCollapse = true;
+    }
+
+    // Consume the deferred-collapse flag if set.  Called from the tail of
+    // the interpreter-completion handlers in PackageMenu / SelectionOverlay
+    // / MainMenu / ScriptOverlay so the Accept item is removed AFTER its
+    // CHECKMARK / CROSSMARK update has been applied.
+    inline bool consumeDeferredCollapse() {
+        if (!g_pendingCollapse) return false;
+        g_pendingCollapse = false;
+        beginCollapseAnim();
+        return true;
+    }
+
+    // Mark the start of a collapse fade-out.  Idempotent across frames; only
+    // the first call per dismissal is meaningful.
+    inline void beginCollapseAnim() {
+        if (g_acceptItem == nullptr) return;          // nothing to collapse
+        if (g_collapseStartTick != 0)  return;        // already collapsing
+        g_collapseStartTick = armGetSystemTick();
+
+        // Hide focus highlight on Accept (and defensively on banner) so the
+        // 220 ms fade-out is visually clean: the user sees banner+Accept
+        // dissolve without a bright focus ring jumping around.  Gui's
+        // m_focusedElement pointer still references Accept here, but its
+        // m_focused flag is false, so Element::frame() skips both
+        // drawFocusBackground() and drawHighlight().  collapseUI() at the end
+        // of the animation will transfer focus to the source item, which sets
+        // setFocused(true) and lets the highlight animate in smoothly on the
+        // original menu row.
+        if (g_acceptItem != nullptr) g_acceptItem->setFocused(false);
+        if (g_banner     != nullptr) g_banner    ->setFocused(false);
+    }
+
+    // Per-frame poll: once the collapse fade-out has elapsed, actually drop
+    // banner+Accept from the list.  Called from PackageMenu/MainMenu
+    // handleInput overrides every frame.
+    inline bool tickCollapseAnim() {
+        if (g_collapseStartTick == 0) return false;
+        const u64 elapsedNs = armTicksToNs(armGetSystemTick() - g_collapseStartTick);
+        if (elapsedNs >= COLLAPSE_ANIM_NS) {
+            collapseUI();          // also clears g_collapseStartTick
+            return true;
+        }
+        return false;
+    }
+
+    // Mark that focus should jump to the Accept item once it has been actually
+    // inserted into m_items (which only happens during the next List::draw
+    // pass).  Calling tsl::Gui::requestFocus(acceptItem, ...) directly from
+    // expand() is a no-op because List::requestFocus() returns nullptr while
+    // m_itemsToAdd is non-empty.  So we set a flag here and let the next
+    // handleInput frame in PackageMenu / MainMenu run the actual transfer
+    // through consumePendingFocusToAccept().
+    inline void requestFocusToAccept() {
+        if (g_acceptItem != nullptr) g_pendingFocusToAccept = true;
+    }
+
+    // Try to transfer focus to the Accept item.  Returns true once the
+    // transfer was actually performed (or aborted because state went stale).
+    // Returns false if Accept is not yet in m_items so the caller knows to
+    // try again on the following frame.
+    inline bool consumePendingFocusToAccept() {
+        if (!g_pendingFocusToAccept) return false;
+        if (g_list == nullptr || g_acceptItem == nullptr) {
+            g_pendingFocusToAccept = false;
+            return true;
+        }
+        const s32 idx = g_list->getIndexInList(g_acceptItem);
+        if (idx < 0) return false;  // not yet inserted; try next frame
+
+        auto* tslOverlay = tsl::Overlay::get();
+        auto* gui = (tslOverlay != nullptr) ? tslOverlay->getCurrentGui().get() : nullptr;
+        if (gui != nullptr) {
+            g_list->setFocusedIndex(static_cast<u32>(idx));
+            gui->requestFocus(g_acceptItem, tsl::FocusDirection::None, false);
+        }
+        g_pendingFocusToAccept = false;
+        return true;
+    }
+
+    // Insert the warning banner + Accept item right under `sourceItem` in
+    // `list`.  The Accept item, when held to completion, runs `commandsToRun`
+    // through the existing handleCommandHold pipeline.
+    inline void expand(tsl::elm::List* list,
+                       tsl::elm::ListItem* sourceItem,
+                       const std::string& warningText,
+                       std::vector<std::vector<std::string>> commandsToRun,
+                       const std::string& packagePath,
+                       const std::string& keyName,
+                       const std::string& acceptText = std::string(),
+                       std::function<void()> onConfirmExtra = nullptr,
+                       u64 holdMsOverride = 0,
+                       const std::string& accentHex = std::string(),
+                       const std::string& iconName  = std::string()) {
+        if (list == nullptr || sourceItem == nullptr || warningText.empty())
+            return;
+
+        // Collapse any other active warning first (single-active rule).
+        // Use immediate (non-animated) collapse so the new banner doesn't visually
+        // overlap with a fading old one.
+        if (isActive()) collapse(false);
+
+        // After single-active-rule replacement, collapseUI started a settle
+        // window targeting the OLD source.  We're about to install a brand
+        // new banner+Accept whose focus path is independent, so clear that
+        // pending settle now -- otherwise tickSettle could 250 ms from now
+        // call setFocused(true) on the old source while the new Accept is
+        // the actual focused element, painting two highlights on screen.
+        g_settleStartTick = 0;
+        g_settleTarget    = nullptr;
+
+        const s32 sourceIdx = list->getIndexInList(sourceItem);
+        if (sourceIdx < 0) return;
+        const ssize_t insertAt = sourceIdx + 1;
+
+        // Banner: yellow accent bar on the left + warning glyph + multi-line
+        // text (split on '\n').  Width-wise, full list width minus padding;
+        // height computed from line count.
+        const int lineCount = 1 + static_cast<int>(
+            std::count(warningText.begin(), warningText.end(), '\n'));
+        const s32 lineHeight = 22;
+        const s32 topPad     = 8;
+        const s32 botPad     = 8;
+        const u16 bannerH    = static_cast<u16>(topPad + lineCount * lineHeight + botPad);
+
+        std::string textCopy = warningText;
+        const u64 expandStartTick = armGetSystemTick();
+
+        // Resolve runtime-overridable accent color + icon shape.  parseHexColor()
+        // falls back to the default warning yellow on parse error; parseIconKind()
+        // falls back to Triangle on unknown/empty.
+        const tsl::Color accentColor = parseHexColor(accentHex, tsl::warningTextColor);
+        const IconKind   iconKind    = parseIconKind(iconName);
+        g_accentColor = accentColor;  // shared with WarningAcceptListItem::draw()
+
+        auto* banner = new tsl::elm::CustomDrawer(
+            [text = std::move(textCopy), lineHeight, expandStartTick, accentColor, iconKind]
+            (tsl::gfx::Renderer* r, s32 x, s32 y, s32 w, s32 h) {
+                // Expand fade-in over ~150 ms, multiplicatively combined with
+                // collapse fade-out over ~220 ms (when active).  This avoids
+                // the previous one-frame snap on dismissal.
+                const u64 nowTick = armGetSystemTick();
+                const u64 elapsedInNs = armTicksToNs(nowTick - expandStartTick);
+                float alpha = (elapsedInNs >= EXPAND_ANIM_NS) ? 1.0f
+                                                              : (static_cast<float>(elapsedInNs) / static_cast<float>(EXPAND_ANIM_NS));
+                if (g_collapseStartTick != 0) {
+                    const u64 elapsedOutNs = armTicksToNs(nowTick - g_collapseStartTick);
+                    const float tout = (elapsedOutNs >= COLLAPSE_ANIM_NS) ? 1.0f
+                                                                          : (static_cast<float>(elapsedOutNs) / static_cast<float>(COLLAPSE_ANIM_NS));
+                    alpha *= (1.0f - tout);
+                }
+                if (alpha < 0.0f) alpha = 0.0f;
+                const u8 alphaScale = static_cast<u8>(0xF * alpha);
+                auto fade = [alphaScale](const tsl::Color& c) {
+                    const u8 a = static_cast<u8>((static_cast<u32>(c.a) * alphaScale) / 0xF);
+                    return tsl::Color(c.r, c.g, c.b, a);
+                };
+
+                // Indent banner content noticeably relative to source-item left edge
+                // so banner+Accept visually nest under the originating item.
+                const s32 accentX = x + BANNER_INDENT_PX;
+                // Banner strip skips its top 6 px so the focus-border halo of
+                // the source item above (libtesla draws its bottom halo at
+                // source.y + source.h + 1, height 5) is not painted over by
+                // the strip when the source is currently focused.  Items render
+                // in list order, so the strip would otherwise be drawn AFTER
+                // (= on top of) the source's halo and visually mask it.
+                constexpr s32 HALO_EXTENT_PX = 6;
+                r->drawRect(accentX, y + HALO_EXTENT_PX,
+                            ACCENT_WIDTH_PX, h - HALO_EXTENT_PX,
+                            fade(accentColor));
+
+                // Icon glyph next to the accent strip.  All shapes drawn via
+                // drawRect / drawLine / drawCircle so we don't depend on the
+                // bundled font containing U+26A0 etc.
+                const s32 glyphSize = 18;
+                const s32 glyphX    = accentX + ACCENT_WIDTH_PX + 8;  // left edge of glyph box
+                const s32 glyphY    = y + 6;                          // top edge
+                if (iconKind != IconKind::None) {
+                    const s32 cx     = glyphX + glyphSize / 2;
+                    const s32 cy     = glyphY + glyphSize / 2;
+                    const tsl::Color fill = fade(accentColor);
+                    const tsl::Color mark = fade(tsl::Color(0x0, 0x0, 0x0, 0xF));
+
+                    if (iconKind == IconKind::Triangle) {
+                        // Filled isosceles triangle, apex up, with dark "!" inside.
+                        const s32 apexY = glyphY + 1;
+                        const s32 baseY = glyphY + glyphSize - 1;
+                        const s32 baseHalfW = glyphSize / 2 - 1;
+                        const s32 height = baseY - apexY;
+                        for (s32 dy = 0; dy <= height; ++dy) {
+                            const s32 halfW = (baseHalfW * dy) / (height == 0 ? 1 : height);
+                            r->drawLine(cx - halfW, apexY + dy, cx + halfW, apexY + dy, fill);
+                        }
+                        const s32 stemH   = std::max<s32>(4, glyphSize / 2 - 4);
+                        const s32 stemTop = apexY + (height / 2) - stemH / 2;
+                        r->drawRect(cx - 1, stemTop, 2, stemH, mark);
+                        r->drawRect(cx - 1, stemTop + stemH + 1, 2, 2, mark);
+                    } else if (iconKind == IconKind::Info) {
+                        // Filled circle with dark "i" (dot near top + short stem).
+                        r->drawCircle(cx, cy, static_cast<u16>(glyphSize / 2), true, fill);
+                        const s32 dotY = cy - glyphSize / 2 + 3;
+                        r->drawRect(cx - 1, dotY, 2, 2, mark);
+                        const s32 stemTop = dotY + 4;
+                        const s32 stemH   = std::max<s32>(4, glyphSize / 2 - 1);
+                        r->drawRect(cx - 1, stemTop, 2, stemH, mark);
+                    } else if (iconKind == IconKind::Error) {
+                        // Filled circle with dark "X" (two crossed lines).
+                        r->drawCircle(cx, cy, static_cast<u16>(glyphSize / 2), true, fill);
+                        const s32 d = glyphSize / 2 - 3;
+                        r->drawLine(cx - d, cy - d, cx + d, cy + d, mark);
+                        r->drawLine(cx - d, cy - d + 1, cx + d, cy + d + 1, mark);
+                        r->drawLine(cx - d, cy + d, cx + d, cy - d, mark);
+                        r->drawLine(cx - d, cy + d - 1, cx + d, cy - d - 1, mark);
+                    }
+                }
+                const s32 textX  = (iconKind == IconKind::None)
+                                       ? (accentX + ACCENT_WIDTH_PX + 8)
+                                       : (glyphX + glyphSize + 8);
+                const u32 fontSize = 17;
+                s32 cursor = y + 4 + lineHeight;
+
+                const tsl::Color textCol = fade(tsl::defaultTextColor);
+                size_t start = 0;
+                while (start <= text.size()) {
+                    size_t end = text.find('\n', start);
+                    const std::string line = (end == std::string::npos)
+                        ? text.substr(start)
+                        : text.substr(start, end - start);
+                    r->drawString(line, false, textX, cursor, fontSize, textCol);
+                    cursor += lineHeight;
+                    if (end == std::string::npos) break;
+                    start = end + 1;
+                }
+            });
+
+        list->addItem(banner, bannerH, insertAt);
+
+        // Accept item: regular ListItem with hold-A behaviour.  We piggy-back
+        // on the existing global lastCommandIsHold + handleCommandHold pipeline
+        // so the user gets the same progress bar / rumble feedback as a
+        // ;hold=true item.  Four leading spaces nest the label visually under
+        // the source item, matching the banner indent below.
+        const std::string acceptLabel = std::string("    ")
+            + (acceptText.empty() ? std::string("Hold A to confirm") : acceptText);
+        auto* acceptItem = new WarningAcceptListItem(acceptLabel);
+        acceptItem->m_expandStartTick = expandStartTick;  // sync fade timing with banner
+        acceptItem->m_accentColor     = accentColor;      // match banner's accent strip color
+        acceptItem->enableTouchHolding();
+        acceptItem->setValue(HOLD_A_SYMBOL, true);
+        acceptItem->disableClickAnimation();
+
+        std::vector<std::vector<std::string>> capturedCmds = std::move(commandsToRun);
+        const std::string capturedPkgPath = packagePath;
+        const std::string capturedKeyName = keyName;
+        std::function<void()> capturedOnConfirm = std::move(onConfirmExtra);
+
+        acceptItem->setClickListener(
+            [acceptItem,
+             cmds = std::move(capturedCmds),
+             pkgPath = capturedPkgPath,
+             keyName = capturedKeyName,
+             onConfirm = std::move(capturedOnConfirm),
+             overrideMs = holdMsOverride](uint64_t keys) mutable -> bool {
+                if (runningInterpreter.load(std::memory_order_acquire))
+                    return false;
+
+                if ((keys & KEY_A) && !(keys & ~KEY_A & ALL_KEYS_MASK)) {
+                    if (lastCommandIsHold) return true;  // already counting
+
+                    lastSelectedListItemFooter   = acceptItem->getValue();
+                    lastFooterHighlight          = false;
+                    lastFooterHighlightDefined   = false;
+                    acceptItem->setValue(INPROGRESS_SYMBOL);
+                    lastSelectedListItem         = acceptItem;
+
+                    // Per-item ;hold_seconds= override.  processHold() reads
+                    // holdDurationMsOverride before falling back to ult::holdDurationMs.
+                    holdDurationMsOverride       = overrideMs;
+                    holdStartTick                = armGetSystemTick();
+                    storedCommands               = cmds;  // copy; allows re-hold
+                    lastCommandMode              = DEFAULT_STR;
+                    lastCommandIsHold            = true;
+                    lastKeyName                  = keyName;
+                    warningOnConfirmCallback     = onConfirm;  // copy; persists across re-holds
+                    return true;
+                }
+                return false;
+            });
+
+        list->addItem(acceptItem, 0, insertAt + 1);
+
+        g_banner     = banner;
+        g_acceptItem = acceptItem;
+        g_list       = list;
+        g_sourceItem = sourceItem;
+
+        // Defer focus transfer to Accept until it is actually inserted into
+        // m_items by List::draw -> addPendingItems on the next frame.  Calling
+        // requestFocus() now is a no-op because List::requestFocus() returns
+        // nullptr while m_itemsToAdd is non-empty.
+        requestFocusToAccept();
+    }
+
+}  // namespace WarningConfirm
+
 // Forward declaration of the MainMenu class.
 class MainMenu;
 
@@ -1907,6 +2580,7 @@ public:
             }
             signalFeedback();
 
+            WarningConfirm::consumeDeferredCollapse();
             return true;
         }
         
@@ -2910,6 +3584,7 @@ public:
                 reloadSoundCacheNow.store(true, std::memory_order_release);
             }
             signalFeedback();
+            WarningConfirm::consumeDeferredCollapse();
             return true;
         }
         
@@ -4023,6 +4698,7 @@ public:
             }
             signalFeedback();
 
+            WarningConfirm::consumeDeferredCollapse();
             return true;
         }
         
@@ -4306,6 +4982,13 @@ bool drawCommandsMenu(
     bool commandFooterHighlight;
     bool commandFooterHighlightDefined;
     bool isHold;
+    u64  holdMsOverride = 0;  // optional ;hold_seconds=N override (0 = use ult::holdDurationMs)
+    std::string warningText;
+    std::string warningOnText;
+    std::string warningOffText;
+    std::string acceptText;  // optional ;accept=TEXT override for hold-A button label
+    std::string warningColorHex;   // optional ;warning_color=#RRGGBB (or RRGGBB) override
+    std::string warningIconName;   // optional ;warning_icon=triangle|info|error|none
 
     std::string commandSystem;
     std::string commandState;
@@ -4421,6 +5104,13 @@ bool drawCommandsMenu(
         commandFooterHighlight = false;
         commandFooterHighlightDefined = false;
         isHold = false;
+        holdMsOverride = 0;
+        warningText.clear();
+        warningOnText.clear();
+        warningOffText.clear();
+        acceptText.clear();
+        warningColorHex.clear();
+        warningIconName.clear();
         commandSystem = DEFAULT_STR;
         commandState = DEFAULT_STR;
         commandHOSFirmware = "";
@@ -4843,6 +5533,12 @@ bool drawCommandsMenu(
                                     commandHOSFirmware = commandName.substr(HOS_VERSION_PATTERN_LEN);
                                     continue;
                                 }
+                                if (commandName.size() > HOLD_SECONDS_PATTERN_LEN &&
+                                    commandName.compare(0, HOLD_SECONDS_PATTERN_LEN, HOLD_SECONDS_PATTERN) == 0) {
+                                    const float sec = ult::stof(commandName.substr(HOLD_SECONDS_PATTERN_LEN));
+                                    if (sec > 0.0f) holdMsOverride = static_cast<u64>(sec * 1000.0f);
+                                    continue;
+                                }
                                 if (parseBoolFlag(commandName, HOLD_PATTERN, isHold)) continue;
                                 if (parseBoolFlag(commandName, HEADER_INDENT_PATTERN, useHeaderIndent)) continue;
                                 break;
@@ -4889,6 +5585,14 @@ bool drawCommandsMenu(
                                 break;
                                 
                             case 'a':
+                                if (commandName.size() >= ACCEPT_PATTERN_LEN &&
+                                    commandName.compare(0, ACCEPT_PATTERN_LEN, ACCEPT_PATTERN) == 0) {
+                                    acceptText = commandName.substr(ACCEPT_PATTERN_LEN);
+                                    for (size_t j = 1; j < cmd.size(); ++j) acceptText += " " + cmd[j];
+                                    removeQuotes(acceptText);
+                                    WarningConfirm::unescapeWarningText(acceptText);
+                                    continue;
+                                }
                                 if (commandName.compare(0, AMS_VERSION_PATTERN_LEN, AMS_VERSION_PATTERN) == 0) {
                                     commandAMSFirmware = commandName.substr(AMS_VERSION_PATTERN_LEN);
                                     continue;
@@ -4900,6 +5604,43 @@ bool drawCommandsMenu(
                                 break;
                                 
                             case 'w':
+                                // Warning patterns must be checked _COLOR / _ICON / _OFF / _ON before plain to avoid prefix collision.
+                                if (commandName.size() > WARNING_COLOR_PATTERN_LEN &&
+                                    commandName.compare(0, WARNING_COLOR_PATTERN_LEN, WARNING_COLOR_PATTERN) == 0) {
+                                    warningColorHex = commandName.substr(WARNING_COLOR_PATTERN_LEN);
+                                    removeQuotes(warningColorHex);
+                                    continue;
+                                }
+                                if (commandName.size() > WARNING_ICON_PATTERN_LEN &&
+                                    commandName.compare(0, WARNING_ICON_PATTERN_LEN, WARNING_ICON_PATTERN) == 0) {
+                                    warningIconName = commandName.substr(WARNING_ICON_PATTERN_LEN);
+                                    removeQuotes(warningIconName);
+                                    continue;
+                                }
+                                if (commandName.size() >= WARNING_OFF_PATTERN_LEN &&
+                                    commandName.compare(0, WARNING_OFF_PATTERN_LEN, WARNING_OFF_PATTERN) == 0) {
+                                    warningOffText = commandName.substr(WARNING_OFF_PATTERN_LEN);
+                                    for (size_t j = 1; j < cmd.size(); ++j) warningOffText += " " + cmd[j];
+                                    removeQuotes(warningOffText);
+                                    WarningConfirm::unescapeWarningText(warningOffText);
+                                    continue;
+                                }
+                                if (commandName.size() >= WARNING_ON_PATTERN_LEN &&
+                                    commandName.compare(0, WARNING_ON_PATTERN_LEN, WARNING_ON_PATTERN) == 0) {
+                                    warningOnText = commandName.substr(WARNING_ON_PATTERN_LEN);
+                                    for (size_t j = 1; j < cmd.size(); ++j) warningOnText += " " + cmd[j];
+                                    removeQuotes(warningOnText);
+                                    WarningConfirm::unescapeWarningText(warningOnText);
+                                    continue;
+                                }
+                                if (commandName.size() >= WARNING_PATTERN_LEN &&
+                                    commandName.compare(0, WARNING_PATTERN_LEN, WARNING_PATTERN) == 0) {
+                                    warningText = commandName.substr(WARNING_PATTERN_LEN);
+                                    for (size_t j = 1; j < cmd.size(); ++j) warningText += " " + cmd[j];
+                                    removeQuotes(warningText);
+                                    WarningConfirm::unescapeWarningText(warningText);
+                                    continue;
+                                }
                                 if (commandName.compare(0, WRAPPING_MODE_PATTERN_LEN, WRAPPING_MODE_PATTERN) == 0) {
                                     tableWrappingMode = commandName.substr(WRAPPING_MODE_PATTERN_LEN);
                                     continue;
@@ -5552,7 +6293,7 @@ bool drawCommandsMenu(
                         }
 
                         listItem->setClickListener([i, commands, keyName = originalOptionName, cleanOptionName, packagePath, packageName,
-                            selectedItem, listItem, lastPackageHeader, commandMode, footer, isHold, showWidget, commandFooterHighlight, commandFooterHighlightDefined](uint64_t keys) {
+                            selectedItem, listItem, list, warningText, acceptText, holdMsOverride, warningColorHex, warningIconName, lastPackageHeader, commandMode, footer, isHold, showWidget, commandFooterHighlight, commandFooterHighlightDefined](uint64_t keys) {
                             
                             if (runningInterpreter.load(acquire)) {
                                 return false;
@@ -5563,6 +6304,16 @@ bool drawCommandsMenu(
                             }
 
                             if (((keys & KEY_A && !(keys & ~KEY_A & ALL_KEYS_MASK)))) {
+                                if (!warningText.empty()) {
+                                    // Second press of the same source item collapses the open warning.
+                                    if (WarningConfirm::isActiveFor(listItem)) {
+                                        WarningConfirm::collapse(true);
+                                        return true;
+                                    }
+                                    auto warnCmds = getSourceReplacement(commands, selectedItem, i, packagePath);
+                                    WarningConfirm::expand(list, listItem, warningText, std::move(warnCmds), packagePath, keyName, acceptText, nullptr, holdMsOverride, warningColorHex, warningIconName);
+                                    return true;
+                                }
                                 isDownloadCommand.store(false, release);
                                 runningInterpreter.store(true, release);
 
@@ -5661,13 +6412,57 @@ bool drawCommandsMenu(
                         
                         const bool hasToggleState = !toggleStateMode.empty();
                         toggleListItem->setStateChangedListener([i, usingProgress, toggleListItem, commandsOn, commandsOff, keyName = originalOptionName, packagePath, packageConfigIniPath,
-                            pathPatternOn, pathPatternOff, isHold, commandMode, hasToggleState](bool state) {
+                            pathPatternOn, pathPatternOff, isHold, commandMode, hasToggleState,
+                            list, warningText, warningOnText, warningOffText, acceptText, holdMsOverride, warningColorHex, warningIconName](bool state) {
                             if (runningInterpreter.load(std::memory_order_acquire)) {
                                 return;
                             }
                             
                             tsl::Overlay::get()->getCurrentGui()->requestFocus(toggleListItem, tsl::FocusDirection::None);
                             
+                            // Inline warning-confirm: if the package author set a warning, expand a banner+Accept
+                            // pair underneath this toggle and defer execution. Direction-specific texts
+                            // (warning_on / warning_off) win when set; otherwise fall back to plain warning.
+                            const std::string& directionalWarning =
+                                state ? (!warningOnText.empty()  ? warningOnText  : warningText)
+                                      : (!warningOffText.empty() ? warningOffText : warningText);
+                            if (!directionalWarning.empty()) {
+                                // Second press of the same toggle (while warning is already
+                                // expanded) collapses the warning and reverts the visual flip.
+                                if (WarningConfirm::isActiveFor(toggleListItem)) {
+                                    toggleListItem->setState(!state);  // undo the flip the press just triggered
+                                    WarningConfirm::collapse(true);
+                                    return;
+                                }
+                                // Revert visual; Accept-hold completion will flip it back.
+                                toggleListItem->setState(!state);
+
+                                auto warnCmds = state ? getSourceReplacement(commandsOn, pathPatternOn, i, packagePath) :
+                                    getSourceReplacement(commandsOff, pathPatternOff, i, packagePath);
+
+                                const bool targetState  = state;
+                                const bool noConfigPath = hasToggleState;
+                                std::string capturedConfigPath = packageConfigIniPath;
+                                std::string capturedKeyName    = keyName;
+                                auto* capturedToggle = toggleListItem;
+
+                                WarningConfirm::expand(
+                                    list, toggleListItem, directionalWarning,
+                                    std::move(warnCmds), packagePath, keyName, acceptText,
+                                    [capturedToggle, targetState, noConfigPath,
+                                     capturedConfigPath, capturedKeyName]() {
+                                        capturedToggle->setState(targetState);
+                                        if (!noConfigPath) {
+                                            setIniFileValue(capturedConfigPath, capturedKeyName, FOOTER_STR,
+                                                            targetState ? CAPITAL_ON_STR : CAPITAL_OFF_STR);
+                                        }
+                                    },
+                                    holdMsOverride,
+                                    warningColorHex,
+                                    warningIconName);
+                                return;
+                            }
+
                             auto modifiedCmds = state ? getSourceReplacement(commandsOn, pathPatternOn, i, packagePath) :
                                 getSourceReplacement(commandsOff, pathPatternOff, i, packagePath);
 
@@ -5925,8 +6720,32 @@ public:
      */
     virtual bool handleInput(uint64_t keysDown, uint64_t keysHeld, touchPosition touchInput, JoystickPosition leftJoyStick, JoystickPosition rightJoyStick) override {
         
+        // After expand() inserts banner+Accept, focus transfer is deferred
+        // until Accept is actually present in m_items (next frame).
+        WarningConfirm::consumePendingFocusToAccept();
+        // Per-frame poll: once the collapse fade-out has elapsed, actually drop
+        // banner+Accept from the list.
+        WarningConfirm::tickCollapseAnim();
+        // Per-frame poll: once banner+Accept are gone and the List has had
+        // a couple of frames to settle, re-enable the source's focus highlight.
+        WarningConfirm::tickSettle();
+
+        // While the collapse fade-out is in progress, swallow all input so
+        // the user can't trigger a second hold, scroll, or B-cancel while
+        // banner+Accept are still alive but fading.  The subsequent settle
+        // window is purely visual (source highlight suppressed) and stays
+        // input-responsive: tickSettle() checks Gui's focused element before
+        // restoring m_focused, so navigation away during settle is safe.
+        if (WarningConfirm::isCollapsing()) return true;
+
         if (handleCommandHold(keysDown, keysHeld, packagePath)) return true;
-        
+
+        // B-cancel for an active inline warning panel: collapse banner+Accept and consume B.
+        if (WarningConfirm::isActive() && !stillTouching.load(acquire) &&
+            (keysDown & KEY_B) && !(keysHeld & ~KEY_B & ALL_KEYS_MASK)) {
+            WarningConfirm::collapse();
+            return true;
+        }
 
         const bool isRunningInterp = runningInterpreter.load(acquire);
         const bool isTouching = stillTouching.load(acquire);
@@ -5937,6 +6756,7 @@ public:
             
         if (lastRunningInterpreter.exchange(false, std::memory_order_acq_rel)) {
             handleInterpreterCompletion(packageConfigIniPath);
+            WarningConfirm::consumeDeferredCollapse();
             return true;
         }
 
@@ -7110,6 +7930,24 @@ public:
      */
     virtual bool handleInput(uint64_t keysDown, uint64_t keysHeld, touchPosition touchInput, JoystickPosition leftJoyStick, JoystickPosition rightJoyStick) override {
         
+        // After expand() inserts banner+Accept, focus transfer is deferred
+        // until Accept is actually present in m_items (next frame).
+        WarningConfirm::consumePendingFocusToAccept();
+        // Per-frame poll: once the collapse fade-out has elapsed, actually drop
+        // banner+Accept from the list.
+        WarningConfirm::tickCollapseAnim();
+        // Per-frame poll: once banner+Accept are gone and the List has had
+        // a couple of frames to settle, re-enable the source's focus highlight.
+        WarningConfirm::tickSettle();
+
+        // While the collapse fade-out is in progress, swallow all input so
+        // the user can't trigger a second hold, scroll, or B-cancel while
+        // banner+Accept are still alive but fading.  The subsequent settle
+        // window is purely visual (source highlight suppressed) and stays
+        // input-responsive: tickSettle() checks Gui's focused element before
+        // restoring m_focused, so navigation away during settle is safe.
+        if (WarningConfirm::isCollapsing()) return true;
+
         if (handleCommandHold(keysDown, keysHeld, PACKAGE_PATH)) return true;
 
         if (ult::launchingOverlay.load(acquire)) return true;
@@ -7122,6 +7960,7 @@ public:
     
         if (lastRunningInterpreter.exchange(false, std::memory_order_acq_rel)) {
             handleInterpreterCompletion(packageConfigIniPath);
+            WarningConfirm::consumeDeferredCollapse();
             return true;
         }
         
