@@ -4796,6 +4796,16 @@ bool drawCommandsMenu(
                                     } else if (std::find(commandModes.begin(), commandModes.end(), commandMode) == commandModes.end()) {
                                         commandMode = commandModes[0];
                                     }
+                                    // Text-mode reuses the table renderer with friendlier defaults:
+                                    // left aligned, word-wrapped, compact spacing.  These can still be
+                                    // overridden by later directives in the same section.
+                                    if (commandMode == TEXT_STR) {
+                                        tableAlignment    = LEFT_STR;
+                                        tableWrappingMode = "word";
+                                        useWrappingIndent = false;
+                                        tableSpacing      = 1;
+                                        tableStartGap     = 15;
+                                    }
                                     continue;
                                 }
                                 if (parseBoolFlag(commandName, MINI_PATTERN, isMini)) continue;
@@ -4979,7 +4989,7 @@ bool drawCommandsMenu(
                         } else if (currentSection == OFF_STR) {
                             commandsOff.push_back(cmd);
                         }
-                    } else if (commandMode == TABLE_STR) {
+                    } else if (commandMode == TABLE_STR || commandMode == TEXT_STR) {
                         tableData.push_back(cmd);
                         continue;
                     } else if (commandMode == TRACKBAR_STR || commandMode == STEP_TRACKBAR_STR || commandMode == NAMED_STEP_TRACKBAR_STR) {
@@ -5124,6 +5134,43 @@ bool drawCommandsMenu(
             }
 
             if (!skipSection && !skipSystem && !skipVisibility) { // for skipping the drawing of sections
+                if (commandMode == TEXT_STR) {
+                    // Convert each parsed row into a single joined string in cmd[0],
+                    // then route through addTable so the existing placeholder/
+                    // erista-mariko/translation pipeline still applies.  An empty
+                    // row is preserved as a blank line for visual spacing.
+                    std::vector<std::vector<std::string>> textData;
+                    textData.reserve(tableData.size());
+                    std::string joined;
+                    for (const auto& parts : tableData) {
+                        if (parts.empty()) {
+                            textData.push_back({std::string()});
+                            continue;
+                        }
+                        joined.clear();
+                        for (size_t i = 0; i < parts.size(); ++i) {
+                            if (i > 0) joined.push_back(' ');
+                            joined += parts[i];
+                        }
+                        textData.push_back({joined});
+                    }
+                    tableData.clear();
+
+                    if (usingTopPivot) {
+                        if (list->getLastIndex() == 0)
+                            onlyTables = false;
+                        addDummyListItem(list);
+                    }
+
+                    addTable(list, textData, packagePath, tableColumnOffset, tableStartGap, tableEndGap, tableSpacing,
+                        tableSectionTextColor, tableInfoTextColor, tableInfoTextColor, tableAlignment, hideTableBackground, useHeaderIndent, false /*isPolling*/, isScrollableTable, tableWrappingMode, useWrappingIndent);
+
+                    if (usingBottomPivot) {
+                        addDummyListItem(list);
+                    }
+
+                    continue;
+                }
                 if (commandMode == TABLE_STR) {
                     if (useHeaderIndent) {
                         tableColumnOffset = 164;
